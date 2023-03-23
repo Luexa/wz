@@ -5,8 +5,9 @@ const mem = std.mem;
 
 const assert = std.debug.assert;
 
-const wz = @import("../main.zig");
-const util = @import("../util.zig");
+const wz = @import("main.zig");
+const ParserState = @import("common.zig").ParserState;
+const reworkedMetaEql = @import("common.zig").reworkedMetaEql;
 
 pub const ChunkEvent = struct {
     data: []const u8,
@@ -18,7 +19,7 @@ pub const Event = union(enum) {
     chunk: ChunkEvent,
 };
 
-pub fn create(buffer: []u8, reader: anytype) MessageParser(@TypeOf(reader)) {
+pub fn messageParser(buffer: []u8, reader: anytype) MessageParser(@TypeOf(reader)) {
     assert(buffer.len >= 14);
 
     return MessageParser(@TypeOf(reader)).init(buffer, reader);
@@ -37,7 +38,7 @@ pub fn MessageParser(comptime Reader: type) type {
 
         reader: Reader,
 
-        state: util.ParserState = .header,
+        state: ParserState = .header,
 
         pub fn init(buffer: []u8, reader: Reader) Self {
             return .{
@@ -110,7 +111,7 @@ pub fn MessageParser(comptime Reader: type) type {
                     const read = try self.reader.read(self.read_buffer[0..left]);
 
                     if (self.last_header.mask) |mask| {
-                        for (self.read_buffer[0..read]) |*c, i| {
+                        for (self.read_buffer[0..read], 0..) |*c, i| {
                             c.* = c.* ^ mask[(i + self.chunk_read) % 4];
                         }
                     }
@@ -140,7 +141,7 @@ const io = std.io;
 fn testNextField(parser: anytype, expected: ?Event) !void {
     const actual = try parser.next();
 
-    try testing.expect(util.reworkedMetaEql(actual, expected));
+    try testing.expect(reworkedMetaEql(actual, expected));
 }
 
 test "parses simple unmasked payload" {
@@ -149,7 +150,7 @@ test "parses simple unmasked payload" {
 
     var fbs = io.fixedBufferStream(&request);
     var reader = fbs.reader();
-    var parser = create(&read_buffer, reader);
+    var parser = messageParser(&read_buffer, reader);
 
     try testNextField(&parser, .{
         .header = .{
@@ -177,7 +178,7 @@ test "parses simple masked payload" {
 
     var fbs = io.fixedBufferStream(&request);
     var reader = fbs.reader();
-    var parser = create(&read_buffer, reader);
+    var parser = messageParser(&read_buffer, reader);
 
     try testNextField(&parser, .{
         .header = .{
@@ -205,7 +206,7 @@ test "parses longer simple masked payload" {
 
     var fbs = io.fixedBufferStream(&request);
     var reader = fbs.reader();
-    var parser = create(&read_buffer, reader);
+    var parser = messageParser(&read_buffer, reader);
 
     try testNextField(&parser, .{
         .header = .{
@@ -233,7 +234,7 @@ test "parses more than one simple unmasked payload" {
 
     var fbs = io.fixedBufferStream(&request);
     var reader = fbs.reader();
-    var parser = create(&read_buffer, reader);
+    var parser = messageParser(&read_buffer, reader);
 
     try testNextField(&parser, .{
         .header = .{
@@ -299,7 +300,7 @@ test "parses simple unmasked medium payload" {
 
     var fbs = io.fixedBufferStream(&request);
     var reader = fbs.reader();
-    var parser = create(&read_buffer, reader);
+    var parser = messageParser(&read_buffer, reader);
 
     try testNextField(&parser, .{
         .header = .{
@@ -327,7 +328,7 @@ test "parses chunks simple unmasked medium payload" {
 
     var fbs = io.fixedBufferStream(&request);
     var reader = fbs.reader();
-    var parser = create(&read_buffer, reader);
+    var parser = messageParser(&read_buffer, reader);
 
     try testNextField(&parser, .{
         .header = .{
@@ -362,7 +363,7 @@ test "parses simple unmasked large payload" {
 
     var fbs = io.fixedBufferStream(&request);
     var reader = fbs.reader();
-    var parser = create(&read_buffer, reader);
+    var parser = messageParser(&read_buffer, reader);
 
     try testNextField(&parser, .{
         .header = .{

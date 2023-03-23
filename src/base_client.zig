@@ -1,25 +1,32 @@
 const std = @import("std");
 
-const wz = @import("../main.zig");
-const parser = @import("../main.zig").parser.message;
+const wz = @import("main.zig");
+const MessageParser = wz.MessageParser;
 
 const hzzp = @import("hzzp");
 
 const base64 = std.base64;
 const ascii = std.ascii;
 const math = std.math;
-const rand = std.rand;
 const time = std.time;
 const mem = std.mem;
+
+const Random = std.rand.Random;
 
 const Sha1 = std.crypto.hash.Sha1;
 
 const assert = std.debug.assert;
 
-pub fn create(buffer: []u8, reader: anytype, writer: anytype) BaseClient(@TypeOf(reader), @TypeOf(writer)) {
+pub fn baseClient(buffer: []u8, reader: anytype, writer: anytype, prng: Random) BaseClient(@TypeOf(reader), @TypeOf(writer)) {
     assert(buffer.len >= 16);
 
-    return BaseClient(@TypeOf(reader), @TypeOf(writer)).init(buffer, reader, writer);
+    return BaseClient(@TypeOf(reader), @TypeOf(writer)).init(buffer, reader, writer, prng);
+}
+
+pub fn handshakeClient(buffer: []u8, reader: anytype, writer: anytype, prng: Random) HandshakeClient(@TypeOf(reader), @TypeOf(writer)) {
+    assert(buffer.len >= 16);
+
+    return HandshakeClient(@TypeOf(reader), @TypeOf(writer)).init(buffer, reader, writer, prng);
 }
 
 pub const websocket_guid = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
@@ -48,7 +55,7 @@ pub fn HandshakeClient(comptime Reader: type, comptime Writer: type) type {
     return struct {
         const Self = @This();
 
-        prng: std.rand.Random,
+        prng: Random,
         client: HttpClient,
         handshake_key: [handshake_key_length_b64]u8 = undefined,
 
@@ -56,7 +63,7 @@ pub fn HandshakeClient(comptime Reader: type, comptime Writer: type) type {
         got_accept_header: bool = false,
         handshaken: bool = false,
 
-        pub fn init(buffer: []u8, input: Reader, output: Writer, prng: std.rand.Random) Self {
+        pub fn init(buffer: []u8, input: Reader, output: Writer, prng: Random) Self {
             return .{
                 .prng = prng,
                 .client = HttpClient.init(buffer, input, output),
@@ -152,7 +159,7 @@ pub fn HandshakeClient(comptime Reader: type, comptime Writer: type) type {
 }
 
 pub fn BaseClient(comptime Reader: type, comptime Writer: type) type {
-    const ParserType = parser.MessageParser(Reader);
+    const ParserType = MessageParser(Reader);
 
     return struct {
         const Self = @This();
@@ -167,7 +174,7 @@ pub fn BaseClient(comptime Reader: type, comptime Writer: type) type {
         payload_size: usize = 0,
         payload_index: usize = 0,
 
-        prng: std.rand.Random,
+        prng: Random,
 
         // Whether a reader is currently using the read_buffer. if true, parser.next should NOT be called since the
         // reader expects all of the data.
@@ -175,7 +182,7 @@ pub fn BaseClient(comptime Reader: type, comptime Writer: type) type {
 
         pub const handshake = HandshakeClient(Reader, Writer).init;
 
-        pub fn init(buffer: []u8, input: Reader, output: Writer, prng: std.rand.Random) Self {
+        pub fn init(buffer: []u8, input: Reader, output: Writer, prng: Random) Self {
             return .{
                 .parser = ParserType.init(buffer, input),
                 .read_buffer = buffer,
@@ -238,7 +245,7 @@ pub fn BaseClient(comptime Reader: type, comptime Writer: type) type {
             var buffer: [mask_buffer_size]u8 = undefined;
             var index: usize = 0;
 
-            for (payload) |c, i| {
+            for (payload, 0..) |c, i| {
                 buffer[index] = c ^ self.current_mask[(i + self.mask_index) % 4];
 
                 index += 1;
@@ -256,14 +263,14 @@ pub fn BaseClient(comptime Reader: type, comptime Writer: type) type {
             self.mask_index += payload.len;
         }
 
-        pub fn next(self: *Self) ParserType.NextError!?parser.Event {
+        pub fn next(self: *Self) ParserType.NextError!?wz.message_parser.Event {
             assert(!self.self_contained);
 
             return self.parser.next();
         }
 
         pub const ReadNextError = ParserType.NextError;
-        pub fn readNextChunk(self: *Self) ReadNextError!?parser.ChunkEvent {
+        pub fn readNextChunk(self: *Self) ReadNextError!?wz.message_parser.ChunkEvent {
             if (self.parser.state != .chunk) return null;
             assert(!self.self_contained);
 
@@ -326,12 +333,11 @@ pub fn BaseClient(comptime Reader: type, comptime Writer: type) type {
 
 const testing = std.testing;
 
-test "test server required" {
+test {
     const Reader = std.io.FixedBufferStream([]const u8).Reader;
     const Writer = std.io.FixedBufferStream([]u8).Writer;
-
-    std.testing.refAllDecls(HandshakeClient(Reader, Writer));
-    std.testing.refAllDecls(BaseClient(Reader, Writer));
+    testing.refAllDecls(HandshakeClient(Reader, Writer));
+    testing.refAllDecls(BaseClient(Reader, Writer));
 }
 
 test "example usage" {
@@ -343,15 +349,12 @@ test "example usage" {
     const reader = stream.reader();
     const writer = stream.writer();
 
-    const Reader = @TypeOf(reader);
-    const Writer = @TypeOf(writer);
-
     const seed = @truncate(u64, @bitCast(u128, std.time.nanoTimestamp()));
     var prng = std.rand.DefaultPrng.init(seed);
 
-    var handshake = BaseClient(Reader, Writer).handshake(&buffer, reader, writer, prng.random());
+    var handshake = handshakeClient(&buffer, reader, writer, prng.random());
     try handshake.writeStatusLine("/");
-    try handshake.writeHeaderValue("Host", "echo.websocket.org");
+    try handshake.writeHeaderValue("Host", "echo.websocket.events");
     try handshake.finishHeaders();
 
     if (try handshake.wait()) {
