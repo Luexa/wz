@@ -4,7 +4,7 @@
 
     .dependencies = .{
         .hzzp = .{
-            .url = "https://github.com/truemedian/hzzp/archive/dde0ac699652d45f045f73f43b269c92cb51274c.tar.gz",
+            .url = "https://github.com/truemedian/hzzp/archive/501386e13b2f7849128f3b271d23de6127b1d9d7.tar.gz",
             .hash = "12205b0fa8a2232f1d0b892f6c8fd32dc80012bfa99a1cdea6ecde174f9586b72711",
         },
     },
