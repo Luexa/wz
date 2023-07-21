@@ -1,6 +1,5 @@
 const std = @import("std");
 
-const math = std.math;
 const mem = std.mem;
 
 const assert = std.debug.assert;
@@ -67,10 +66,10 @@ pub fn MessageParser(comptime Reader: type) type {
                     self.last_header.rsv1 = self.read_buffer[0] & 0x40 == 0x40;
                     self.last_header.rsv2 = self.read_buffer[0] & 0x20 == 0x20;
                     self.last_header.rsv3 = self.read_buffer[0] & 0x10 == 0x10;
-                    self.last_header.opcode = @intToEnum(wz.Opcode, @truncate(u4, self.read_buffer[0]));
+                    self.last_header.opcode = @enumFromInt(@as(u4, @truncate(self.read_buffer[0])));
 
                     const masked = self.read_buffer[1] & 0x80 == 0x80;
-                    const check_len = @truncate(u7, self.read_buffer[1]);
+                    const check_len: u7 = @truncate(self.read_buffer[1]);
 
                     if (check_len == 127) {
                         const length_read = try self.reader.readAll(self.read_buffer[2..10]);
@@ -107,7 +106,7 @@ pub fn MessageParser(comptime Reader: type) type {
                 },
 
                 .chunk => {
-                    const left = math.min(self.last_header.length - self.chunk_read, self.read_buffer.len);
+                    const left = @min(self.last_header.length - self.chunk_read, self.read_buffer.len);
                     const read = try self.reader.read(self.read_buffer[0..left]);
 
                     if (self.last_header.mask) |mask| {

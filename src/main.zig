@@ -8,8 +8,7 @@ pub const messageParser = message_parser.messageParser;
 pub const base_client = @import("base_client.zig");
 pub const BaseClient = base_client.BaseClient;
 pub const baseClient = base_client.baseClient;
-pub const HandshakeClient = base_client.HandshakeClient;
-pub const handshakeClient = base_client.handshakeClient;
+pub const Handshake = base_client.Handshake;
 
 pub const MessageHeader = @import("common.zig").MessageHeader;
 pub const Opcode = @import("common.zig").Opcode;

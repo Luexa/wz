@@ -10,7 +10,7 @@ Currently untested, contributions towards a test suite are appreciated.
 
 ## Features
 
-* Performs no allocations, uses a single buffer for all parsing.
+* Past the initial handshake which relies on std.http, wz performs no allocations and uses a single buffer for all parsing.
 * Works with any Reader and Writer.
 
 ## Notes

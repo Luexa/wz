@@ -3,13 +3,12 @@ const std = @import("std");
 const wz = @import("main.zig");
 const MessageParser = wz.MessageParser;
 
-const hzzp = @import("hzzp");
-
 const base64 = std.base64;
 const ascii = std.ascii;
 const math = std.math;
 const time = std.time;
 const mem = std.mem;
+const http = std.http;
 
 const Random = std.rand.Random;
 
@@ -21,12 +20,6 @@ pub fn baseClient(buffer: []u8, reader: anytype, writer: anytype, prng: Random) 
     assert(buffer.len >= 16);
 
     return BaseClient(@TypeOf(reader), @TypeOf(writer)).init(buffer, reader, writer, prng);
-}
-
-pub fn handshakeClient(buffer: []u8, reader: anytype, writer: anytype, prng: Random) HandshakeClient(@TypeOf(reader), @TypeOf(writer)) {
-    assert(buffer.len >= 16);
-
-    return HandshakeClient(@TypeOf(reader), @TypeOf(writer)).init(buffer, reader, writer, prng);
 }
 
 pub const websocket_guid = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
@@ -48,115 +41,101 @@ fn checkHandshakeKey(original: []const u8, received: []const u8) bool {
     return mem.eql(u8, &encoded, received);
 }
 
-pub fn HandshakeClient(comptime Reader: type, comptime Writer: type) type {
-    const HttpClient = hzzp.base.client.BaseClient(Reader, Writer);
-    const WzClient = BaseClient(Reader, Writer);
+pub const StdHttpClient = BaseClient(http.Client.Connection.Reader, http.Client.Connection.Writer);
 
-    return struct {
-        const Self = @This();
+pub const Handshake = struct {
+    prng: Random,
+    request: http.Client.Request,
+    handshake_key: [handshake_key_length_b64]u8 = undefined,
 
+    pub const InitError = http.Client.RequestError;
+    pub const StartError = http.Client.Connection.WriteError;
+    pub const WaitError = http.Client.Request.WaitError || error{ InvalidStatus, FailedChallenge, UpgradeFailed };
+
+    pub fn init(
+        http_client: *http.Client,
+        uri: std.Uri,
+        headers: http.Headers,
         prng: Random,
-        client: HttpClient,
-        handshake_key: [handshake_key_length_b64]u8 = undefined,
+    ) InitError!Handshake {
+        if (!mem.eql(u8, "ws", uri.scheme) and !mem.eql(u8, "wss", uri.scheme)) return error.UnsupportedUrlScheme;
+        return .{
+            .prng = prng,
+            .request = try http_client.request(.GET, uri, headers, .{
+                .handle_redirects = false,
+            }),
+        };
+    }
 
-        got_upgrade_header: bool = false,
-        got_accept_header: bool = false,
-        handshaken: bool = false,
+    pub fn deinit(handshake: *Handshake) void {
+        handshake.request.deinit();
+        handshake.* = undefined;
+    }    
 
-        pub fn init(buffer: []u8, input: Reader, output: Writer, prng: Random) Self {
-            return .{
-                .prng = prng,
-                .client = HttpClient.init(buffer, input, output),
-            };
+    fn generateKey(handshake: *Handshake) void {
+        var raw_key: [handshake_key_length]u8 = undefined;
+        handshake.prng.bytes(&raw_key);
+        _ = base64.standard.Encoder.encode(&handshake.handshake_key, &raw_key);
+    }
+
+    pub fn start(handshake: *Handshake) StartError!void {
+        handshake.generateKey();
+
+        var buffered = std.io.bufferedWriter(handshake.request.connection.?.data.writer());
+        const writer = buffered.writer();
+
+        try writer.writeAll(@tagName(handshake.request.method));
+        try writer.writeByte(' ');
+
+        try writer.print("{/}", .{ handshake.request.uri });
+        try writer.writeByte(' ');
+
+        try writer.writeAll(@tagName(handshake.request.version));
+        try writer.writeAll("\r\n");
+
+        if (!handshake.request.headers.contains("host")) {
+            try writer.writeAll("Host: ");
+            try writer.writeAll(handshake.request.uri.host.?);
+            try writer.writeAll("\r\n");
         }
 
-        pub fn generateKey(self: *Self) void {
-            var raw_key: [handshake_key_length]u8 = undefined;
-            self.prng.bytes(&raw_key);
-
-            _ = base64.standard.Encoder.encode(&self.handshake_key, &raw_key);
+        if (!handshake.request.headers.contains("user-agent")) {
+            try writer.writeAll("User-Agent: wz/0.0.8 (zig, std.http)\r\n");
         }
 
-        fn addRequiredHeaders(self: *Self) Writer.Error!void {
-            self.generateKey();
+        try writer.writeAll("Connection: Upgrade\r\n");
+        try writer.writeAll("Upgrade: websocket\r\n");
+        try writer.writeAll("Sec-WebSocket-Version: 13\r\n");
+        try writer.writeAll("Sec-WebSocket-Key: ");
+        try writer.writeAll(&handshake.handshake_key);
+        try writer.writeAll("\r\n");
 
-            try self.client.writeHeaderValue("Connection", "Upgrade");
-            try self.client.writeHeaderValue("Upgrade", "websocket");
-            try self.client.writeHeaderValue("Sec-WebSocket-Version", "13");
-            try self.client.writeHeaderValue("Sec-WebSocket-Key", &self.handshake_key);
-        }
+        try writer.print("{}", .{ handshake.request.headers });
 
-        pub fn writeStatusLine(self: *Self, path: []const u8) Writer.Error!void {
-            try self.client.writeStatusLine("GET", path);
-        }
+        try writer.writeAll("\r\n");
 
-        pub fn writeStatusLineParts(self: *Self, path: []const u8, query: ?[]const u8, fragment: ?[]const u8) Writer.Error!void {
-            try self.client.writeStatusLineParts("GET", path, query, fragment);
-        }
+        try buffered.flush();
+    }
 
-        pub fn writeHeaderValue(self: *Self, name: []const u8, value: []const u8) Writer.Error!void {
-            return self.client.writeHeaderValue(name, value);
-        }
+    pub fn wait(handshake: *Handshake) WaitError!void {
+        try handshake.request.wait();
+        const response = &handshake.request.response;
 
-        pub fn writeHeaderFormat(self: *Self, name: []const u8, comptime format: []const u8, args: anytype) Writer.Error!void {
-            return self.client.writeHeaderFormat(name, format, args);
-        }
+        if (response.status != .switching_protocols) return error.InvalidStatus;
 
-        pub fn writeHeader(self: *Self, header: hzzp.Header) Writer.Error!void {
-            return self.client.writeHeader(header);
-        }
+        const connection_header = response.headers.getFirstValue("connection") orelse return error.UpgradeFailed;
+        if (!ascii.eqlIgnoreCase("upgrade", connection_header)) return error.UpgradeFailed;
 
-        pub fn writeHeaders(self: *Self, headers: hzzp.HeadersSlice) Writer.Error!void {
-            return self.client.writeHeaders(headers);
-        }
+        const accept_header = response.headers.getFirstValue("sec-websocket-accept") orelse return error.UpgradeFailed;
+        if (!checkHandshakeKey(&handshake.handshake_key, accept_header)) return error.FailedChallenge;
+    }
 
-        pub fn finishHeaders(self: *Self) Writer.Error!void {
-            try self.addRequiredHeaders();
-
-            try self.client.finishHeaders();
-        }
-
-        pub const HandshakeError = error{ WrongResponse, InvalidConnectionHeader, FailedChallenge } || HttpClient.NextError;
-        pub fn wait(self: *Self) HandshakeError!bool {
-            while (try self.client.next()) |event| {
-                switch (event) {
-                    .status => |status| {
-                        if (status.code != 101) return error.WrongResponse;
-                    },
-                    .header => |header| {
-                        if (ascii.eqlIgnoreCase(header.name, "connection")) {
-                            self.got_upgrade_header = true;
-
-                            if (!ascii.eqlIgnoreCase(header.value, "upgrade")) {
-                                return error.InvalidConnectionHeader;
-                            }
-                        } else if (ascii.eqlIgnoreCase(header.name, "sec-websocket-accept")) {
-                            self.got_accept_header = true;
-
-                            if (!checkHandshakeKey(&self.handshake_key, header.value)) {
-                                return error.FailedChallenge;
-                            }
-                        }
-                    },
-                    .head_done => break,
-                    .payload => unreachable,
-
-                    .skip => {},
-                    .end => break,
-                }
-            }
-
-            self.handshaken = self.got_upgrade_header and self.got_accept_header;
-            return self.handshaken;
-        }
-
-        pub fn socket(self: Self) WzClient {
-            assert(self.handshaken);
-
-            return WzClient.init(self.client.read_buffer, self.client.parser.reader, self.client.writer, self.prng);
-        }
-    };
-}
+    pub fn client(handshake: *Handshake, read_buffer: []u8) StdHttpClient {
+        const reader = handshake.request.connection.?.data.reader();
+        const writer = handshake.request.connection.?.data.writer();
+        return StdHttpClient.init(read_buffer, reader, writer, handshake.prng);
+    }
+};
 
 pub fn BaseClient(comptime Reader: type, comptime Writer: type) type {
     const ParserType = MessageParser(Reader);
@@ -180,8 +159,6 @@ pub fn BaseClient(comptime Reader: type, comptime Writer: type) type {
         // reader expects all of the data.
         self_contained: bool = false,
 
-        pub const handshake = HandshakeClient(Reader, Writer).init;
-
         pub fn init(buffer: []u8, input: Reader, output: Writer, prng: Random) Self {
             return .{
                 .parser = ParserType.init(buffer, input),
@@ -191,12 +168,12 @@ pub fn BaseClient(comptime Reader: type, comptime Writer: type) type {
             };
         }
 
-        pub const WriteHeaderError = error{MissingMask} || Writer.Error;
+        pub const WriteHeaderError = error{ MissingMask } || Writer.Error;
         pub fn writeHeader(self: *Self, header: wz.MessageHeader) WriteHeaderError!void {
             var bytes: [14]u8 = undefined;
             var len: usize = 2;
 
-            bytes[0] = @enumToInt(header.opcode);
+            bytes[0] = @intFromEnum(header.opcode);
 
             if (header.fin) bytes[0] |= 0x80;
             if (header.rsv1) bytes[0] |= 0x40;
@@ -206,7 +183,7 @@ pub fn BaseClient(comptime Reader: type, comptime Writer: type) type {
             // client messages MUST be masked.
             var mask: [4]u8 = undefined;
             if (header.mask) |m| {
-                std.mem.copy(u8, &mask, &m);
+                @memcpy(&mask, &m);
             } else {
                 self.prng.bytes(&mask);
             }
@@ -214,11 +191,11 @@ pub fn BaseClient(comptime Reader: type, comptime Writer: type) type {
             bytes[1] = 0x80;
 
             if (header.length < 126) {
-                bytes[1] |= @truncate(u8, header.length);
+                bytes[1] |= @truncate(header.length);
             } else if (header.length < 0x10000) {
                 bytes[1] |= 126;
 
-                mem.writeIntBig(u16, bytes[2..4], @truncate(u16, header.length));
+                mem.writeIntBig(u16, bytes[2..4], @as(u16, @truncate(header.length)));
                 len += 2;
             } else {
                 bytes[1] |= 127;
@@ -227,7 +204,7 @@ pub fn BaseClient(comptime Reader: type, comptime Writer: type) type {
                 len += 8;
             }
 
-            std.mem.copy(u8, bytes[len .. len + 4], &mask);
+            @memcpy(bytes[len .. len + 4], &mask);
             len += 4;
 
             try self.writer.writeAll(bytes[0..len]);
@@ -312,10 +289,10 @@ pub fn BaseClient(comptime Reader: type, comptime Writer: type) type {
                 } else unreachable;
             }
 
-            const size = std.math.min(buffer.len, self.payload_size - self.payload_index);
+            const size = @min(buffer.len, self.payload_size - self.payload_index);
             const end = self.payload_index + size;
 
-            mem.copy(u8, buffer[0..size], self.read_buffer[self.payload_index..end]);
+            @memcpy(buffer[0..size], self.read_buffer[self.payload_index..end]);
             self.payload_index = end;
 
             return size;
@@ -334,42 +311,40 @@ pub fn BaseClient(comptime Reader: type, comptime Writer: type) type {
 const testing = std.testing;
 
 test {
-    const Reader = std.io.FixedBufferStream([]const u8).Reader;
-    const Writer = std.io.FixedBufferStream([]u8).Writer;
-    testing.refAllDecls(HandshakeClient(Reader, Writer));
-    testing.refAllDecls(BaseClient(Reader, Writer));
+    testing.refAllDecls(Handshake);
+    testing.refAllDecls(StdHttpClient);
 }
 
-test "example usage" {
-    if (true) return error.SkipZigTest;
+// test "example usage" {
+//     if (true) return error.SkipZigTest;
 
-    var buffer: [256]u8 = undefined;
-    var stream = std.io.fixedBufferStream(&buffer);
+//     var buffer: [256]u8 = undefined;
+//     var stream = std.io.fixedBufferStream(&buffer);
 
-    const reader = stream.reader();
-    const writer = stream.writer();
+//     const reader = stream.reader();
+//     const writer = stream.writer();
 
-    const seed = @truncate(u64, @bitCast(u128, std.time.nanoTimestamp()));
-    var prng = std.rand.DefaultPrng.init(seed);
+//     const seed: u64 = @truncate(@as(u128, @bitCast(std.time.nanoTimestamp())));
+//     var prng = std.rand.DefaultPrng.init(seed);
 
-    var handshake = handshakeClient(&buffer, reader, writer, prng.random());
-    try handshake.writeStatusLine("/");
-    try handshake.writeHeaderValue("Host", "echo.websocket.events");
-    try handshake.finishHeaders();
+//     var handshake = handshakeClient(&buffer, reader, writer, prng.random());
+//     try handshake.writeStatusLine("/");
+//     try handshake.writeHeaderValue("Host", "echo.websocket.events");
+//     try handshake.finishHeaders();
 
-    if (try handshake.wait()) {
-        var client = handshake.socket();
+//     if (try handshake.wait()) {
+//         var client = handshake.socket();
 
-        try client.writeHeader(.{
-            .opcode = .binary,
-            .length = 4,
-        });
+//         try client.writeHeader(.{
+//             .opcode = .binary,
+//             .length = 4,
+//         });
 
-        try client.writeChunk("abcd");
+//         try client.writeChunk("abcd");
 
-        while (try client.next()) |event| {
-            _ = event;
-            // directly from the parser
-        }
-    }
-}
+//         while (try client.next()) |event| {
+//             _ = event;
+//             // directly from the parser
+//         }
+//     }
+// }
