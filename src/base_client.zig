@@ -41,36 +41,40 @@ fn checkHandshakeKey(original: []const u8, received: []const u8) bool {
     return mem.eql(u8, &encoded, received);
 }
 
-pub const StdHttpClient = BaseClient(http.Client.Connection.Reader, http.Client.Connection.Writer);
+pub const HttpWebsocketClient = BaseClient(http.Client.Connection.Reader, http.Client.Connection.Writer);
 
 pub const Handshake = struct {
     prng: Random,
-    request: http.Client.Request,
+    // request: http.Client.Request,
     handshake_key: [handshake_key_length_b64]u8 = undefined,
 
-    pub const InitError = http.Client.RequestError;
-    pub const StartError = http.Client.Connection.WriteError;
-    pub const WaitError = http.Client.Request.WaitError || error{ InvalidStatus, FailedChallenge, UpgradeFailed };
+    // pub const InitError = http.Client.RequestError;
+    // pub const StartError = http.Client.Connection.WriteError;
+    // pub const WaitError = http.Client.Request.WaitError || error{ InvalidStatus, FailedChallenge, UpgradeFailed };
 
-    pub fn init(
-        http_client: *http.Client,
-        uri: std.Uri,
-        headers: http.Headers,
-        prng: Random,
-    ) InitError!Handshake {
-        if (!mem.eql(u8, "ws", uri.scheme) and !mem.eql(u8, "wss", uri.scheme)) return error.UnsupportedUrlScheme;
-        return .{
-            .prng = prng,
-            .request = try http_client.request(.GET, uri, headers, .{
-                .handle_redirects = false,
-            }),
-        };
+    pub fn init(prng: Random) Handshake {
+        return .{ .prng = prng };
     }
 
-    pub fn deinit(handshake: *Handshake) void {
-        handshake.request.deinit();
-        handshake.* = undefined;
-    }    
+    // pub fn init(
+    //     http_client: *http.Client,
+    //     uri: std.Uri,
+    //     headers: http.Headers,
+    //     prng: Random,
+    // ) InitError!Handshake {
+    //     if (!mem.eql(u8, "ws", uri.scheme) and !mem.eql(u8, "wss", uri.scheme)) return error.UnsupportedUrlScheme;
+    //     return .{
+    //         .prng = prng,
+    //         .request = try http_client.request(.GET, uri, headers, .{
+    //             .handle_redirects = false,
+    //         }),
+    //     };
+    // }
+
+    // pub fn deinit(handshake: *Handshake) void {
+    //     handshake.request.deinit();
+    //     handshake.* = undefined;
+    // }    
 
     fn generateKey(handshake: *Handshake) void {
         var raw_key: [handshake_key_length]u8 = undefined;
@@ -78,30 +82,24 @@ pub const Handshake = struct {
         _ = base64.standard.Encoder.encode(&handshake.handshake_key, &raw_key);
     }
 
-    pub fn start(handshake: *Handshake) StartError!void {
-        handshake.generateKey();
+    pub fn writeStatusLine(writer: anytype, uri: std.Uri) !void {
+        try writer.writeAll("GET ");
+        try writer.print("{/}", .{ uri });
+        try writer.writeAll(" HTTP/1.1\r\n");
+    }
 
-        var buffered = std.io.bufferedWriter(handshake.request.connection.?.data.writer());
-        const writer = buffered.writer();
-
-        try writer.writeAll(@tagName(handshake.request.method));
-        try writer.writeByte(' ');
-
-        try writer.print("{/}", .{ handshake.request.uri });
-        try writer.writeByte(' ');
-
-        try writer.writeAll(@tagName(handshake.request.version));
+    pub fn writeHost(writer: anytype, uri: std.Uri) !void {
+        try writer.writeAll("Host: ");
+        try writer.writeAll(uri.host.?);
         try writer.writeAll("\r\n");
+    }
 
-        if (!handshake.request.headers.contains("host")) {
-            try writer.writeAll("Host: ");
-            try writer.writeAll(handshake.request.uri.host.?);
-            try writer.writeAll("\r\n");
-        }
+    pub fn writeUserAgent(writer: anytype) !void {
+        try writer.writeAll("User-Agent: wz/0.0.8 (zig, std.http)\r\n");
+    }
 
-        if (!handshake.request.headers.contains("user-agent")) {
-            try writer.writeAll("User-Agent: wz/0.0.8 (zig, std.http)\r\n");
-        }
+    pub fn writeWebsocketHeaders(handshake: *Handshake, writer: anytype) !void {
+        handshake.generateKey();
 
         try writer.writeAll("Connection: Upgrade\r\n");
         try writer.writeAll("Upgrade: websocket\r\n");
@@ -109,31 +107,88 @@ pub const Handshake = struct {
         try writer.writeAll("Sec-WebSocket-Key: ");
         try writer.writeAll(&handshake.handshake_key);
         try writer.writeAll("\r\n");
+    }
 
-        try writer.print("{}", .{ handshake.request.headers });
-
+    pub fn finishHeaders(writer: anytype) !void {
         try writer.writeAll("\r\n");
+    }
+
+    pub fn validateResponse(
+        handshake: *const Handshake,
+        status: http.Status,
+        connection_header: []const u8,
+        sec_websocket_accept_header: []const u8,
+    ) !void {
+        if (status != .switching_protocols) return error.InvalidStatus;
+        if (!ascii.eqlIgnoreCase("upgrade", connection_header)) return error.UpgradeFailed;
+        if (!checkHandshakeKey(&handshake.handshake_key, sec_websocket_accept_header)) return error.FailedChallenge;
+    }
+};
+
+pub const HttpHandshakeClient = struct {
+    handshake: Handshake,
+    request: http.Client.Request,
+
+    pub fn init(
+        http_client: *http.Client,
+        uri: std.Uri,
+        headers: http.Headers,
+        prng: Random,
+    ) !HttpHandshakeClient {
+        if (!mem.eql(u8, "ws", uri.scheme) and !mem.eql(u8, "wss", uri.scheme)) return error.UnsupportedUrlScheme;
+        return .{
+            .handshake = Handshake.init(prng),
+            .request = try http_client.request(.GET, uri, headers, .{
+                .handle_redirects = false,
+            }),
+        };
+    }
+
+    pub fn deinit(handshake_client: *HttpHandshakeClient) void {
+        handshake_client.request.deinit();
+        handshake_client.* = undefined;
+    }
+
+    pub fn start(handshake_client: *HttpHandshakeClient) !void {
+        var buffered = std.io.bufferedWriter(handshake_client.request.connection.?.data.writer());
+        const writer = buffered.writer();
+
+        const headers = &handshake_client.request.headers;
+
+        try Handshake.writeStatusLine(writer, handshake_client.request.uri);
+        if (!headers.contains("host")) {
+            try Handshake.writeHost(writer, handshake_client.request.uri);
+        }
+        if (!headers.contains("user-agent")) {
+            try Handshake.writeUserAgent(writer);
+        }
+        try handshake_client.handshake.writeWebsocketHeaders(writer);
+        try writer.print("{}", .{ headers.* });
+        try Handshake.finishHeaders(writer);
 
         try buffered.flush();
     }
 
-    pub fn wait(handshake: *Handshake) WaitError!void {
-        try handshake.request.wait();
-        const response = &handshake.request.response;
-
-        if (response.status != .switching_protocols) return error.InvalidStatus;
+    pub fn wait(handshake_client: *HttpHandshakeClient) !void {
+        try handshake_client.request.wait();
+        const response = &handshake_client.request.response;
 
         const connection_header = response.headers.getFirstValue("connection") orelse return error.UpgradeFailed;
-        if (!ascii.eqlIgnoreCase("upgrade", connection_header)) return error.UpgradeFailed;
-
-        const accept_header = response.headers.getFirstValue("sec-websocket-accept") orelse return error.UpgradeFailed;
-        if (!checkHandshakeKey(&handshake.handshake_key, accept_header)) return error.FailedChallenge;
+        const sec_websocket_accept_header = response.headers.getFirstValue("sec-websocket-accept") orelse return error.UpgradeFailed;
+        try handshake_client.handshake.validateResponse(
+            response.status,
+            connection_header,
+            sec_websocket_accept_header,
+        );
     }
 
-    pub fn client(handshake: *Handshake, read_buffer: []u8) StdHttpClient {
-        const reader = handshake.request.connection.?.data.reader();
-        const writer = handshake.request.connection.?.data.writer();
-        return StdHttpClient.init(read_buffer, reader, writer, handshake.prng);
+    pub fn websocketClient(handshake_client: *HttpHandshakeClient, read_buffer: []u8) !HttpWebsocketClient {
+        return baseClient(
+            read_buffer,
+            handshake_client.request.connection.?.data.reader(),
+            handshake_client.request.connection.?.data.writer(),
+            handshake_client.handshake.prng,
+        );
     }
 };
 
@@ -312,7 +367,8 @@ const testing = std.testing;
 
 test {
     testing.refAllDecls(Handshake);
-    testing.refAllDecls(StdHttpClient);
+    testing.refAllDecls(HttpHandshakeClient);
+    testing.refAllDecls(HttpWebsocketClient);
 }
 
 // test "example usage" {
